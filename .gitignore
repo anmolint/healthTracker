@@ -1,0 +1,9 @@
+credentials.json
+.env
+__pycache__/
+*.pyc
+*.pyo
+charts/
+*.png
+.DS_Store
+.venv
