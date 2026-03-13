@@ -100,4 +100,3 @@ health-agent/
 └── README.md
 ```
 
-> ⚠️ Never commit `credentials.json` to git. Add it to `.gitignore`.
