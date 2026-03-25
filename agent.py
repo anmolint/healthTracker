@@ -4,8 +4,8 @@ import json
 from dotenv import load_dotenv
 import anthropic
 
-from sheets import append_row, read_data, get_summary_stats, generate_chart
-from googlefit_import import import_fit_csv_summary
+from sheets import append_row, read_data, get_summary_stats, generate_chart, clear_sheet
+from googlefit_import import import_consolidated, import_summary
 
 load_dotenv()
 
@@ -15,11 +15,12 @@ Your job is to help the user log their daily health metrics (weight, steps, bloo
 and generate charts and insights on demand based on their stored data.
 
 Use the provided tools to:
-1. `append_row`: Log new health data.
+1. `append_row`: Log new health data (one row, one API call).
 2. `read_data`: Read historical data for a specific metric.
 3. `get_summary_stats`: Get basic statistics for a metric over a time period.
 4. `generate_chart`: Generate a chart (line, bar, scatter) and save it as a PNG image.
-5. `import_google_fit_csv`: Import historical data from a Google Fit CSV export (from Google Takeout).
+5. `import_google_fit_csv`: Import historical data from a Google Fit CSV export and append to existing data. All rows are written in a single batch API call.
+6. `bulk_import_google_fit_csv`: Clear all existing sheet data first, then import from Google Fit CSV using a single batch API call. Use this when the user says 'bulk import', 'replace all data', or 'start fresh'. Always confirm with the user before running this since existing data cannot be recovered.
 
 When a chart is generated, inform the user where it was saved.
 When the user wants to import Google Fit data, ask for the CSV file path if they haven't provided one.
@@ -114,21 +115,61 @@ TOOLS = [
             },
             "required": ["chart_type", "metric"]
         }
-    }
-    ,
+    },
     {
         "name": "import_google_fit_csv",
-        "description": "Import historical health data from a Google Fit CSV export file (downloaded from Google Takeout). Parses steps and weight data and logs each day to Google Sheets. Ask the user for the file path if not provided.",
+        "description": (
+            "Import historical health data from a Google Fit Daily_activity_metrics.csv "
+            "export. Appends to existing sheet data without clearing it. "
+            "All rows are written in a single batch API call (not one call per row). "
+            "Use dry_run=true to preview without writing to Sheets."
+        ),
         "input_schema": {
             "type": "object",
             "properties": {
                 "file_path": {
                     "type": "string",
-                    "description": "Absolute or relative path to the Google Fit CSV file (e.g. '~/Downloads/Daily Summaries.csv')."
+                    "description": "Path to Daily_activity_metrics.csv (e.g. '~/Downloads/Daily_activity_metrics.csv')."
                 },
                 "dry_run": {
                     "type": "boolean",
-                    "description": "If true, parse and preview the data without writing to Google Sheets. Default is false."
+                    "description": "If true, parse and preview without writing to Sheets. Default is false."
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "Optional. Only import rows on or after this date (YYYY-MM-DD)."
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "Optional. Only import rows on or before this date (YYYY-MM-DD)."
+                }
+            },
+            "required": ["file_path"]
+        }
+    },
+    {
+        "name": "bulk_import_google_fit_csv",
+        "description": (
+            "Clear ALL existing data from the sheet, then import from a Google Fit "
+            "Daily_activity_metrics.csv using a single batch API call. "
+            "Use this when the user wants a fresh import or says 'bulk import', "
+            "'replace all data', or 'start fresh'. "
+            "Always confirm with the user before calling this — existing data cannot be recovered."
+        ),
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "file_path": {
+                    "type": "string",
+                    "description": "Path to Daily_activity_metrics.csv."
+                },
+                "start_date": {
+                    "type": "string",
+                    "description": "Optional. Only import rows on or after this date (YYYY-MM-DD)."
+                },
+                "end_date": {
+                    "type": "string",
+                    "description": "Optional. Only import rows on or before this date (YYYY-MM-DD)."
                 }
             },
             "required": ["file_path"]
@@ -146,7 +187,21 @@ def execute_tool(tool_name: str, tool_input: dict):
     elif tool_name == "generate_chart":
         return generate_chart(**tool_input)
     elif tool_name == "import_google_fit_csv":
-        return import_fit_csv_summary(**tool_input)
+        return import_summary(
+            file_path=tool_input["file_path"],
+            dry_run=tool_input.get("dry_run", False),
+            start_date=tool_input.get("start_date"),
+            end_date=tool_input.get("end_date"),
+        )
+    elif tool_name == "bulk_import_google_fit_csv":
+        clear_result = clear_sheet()
+        import_result = import_summary(
+            file_path=tool_input["file_path"],
+            dry_run=False,
+            start_date=tool_input.get("start_date"),
+            end_date=tool_input.get("end_date"),
+        )
+        return f"{clear_result}\n{import_result}"
     else:
         raise ValueError(f"Unknown tool: {tool_name}")
 
@@ -156,23 +211,23 @@ def main():
         sys.exit(1)
 
     client = anthropic.Anthropic()
-    
+
     print("🏥 Health Tracker Agent is running. Type 'exit' or 'quit' to stop.")
-    
+
     messages = []
-    
+
     while True:
         try:
             user_input = input("\nYou: ")
             if user_input.lower() in ("exit", "quit"):
                 print("Goodbye!")
                 break
-            
+
             if not user_input.strip():
                 continue
-            
+
             messages.append({"role": "user", "content": user_input})
-            
+
             while True:
                 response = client.messages.create(
                     model="claude-sonnet-4-6",
@@ -181,22 +236,18 @@ def main():
                     system=SYSTEM_PROMPT,
                     messages=messages,
                 )
-                
-                # Append assistant's response to messages
+
                 messages.append({"role": "assistant", "content": response.content})
-                
-                # Check for tool use
+
                 tool_uses = [block for block in response.content if block.type == "tool_use"]
-                
-                # Print text blocks if present
+
                 for block in response.content:
                     if block.type == "text":
                         print(f"\nAgent: {block.text}")
-                
+
                 if not tool_uses:
                     break
-                
-                # Execute tools
+
                 tool_results = []
                 for tool_use in tool_uses:
                     try:
@@ -215,9 +266,9 @@ def main():
                             "content": f"Error executing {tool_use.name}: {str(e)}",
                             "is_error": True
                         })
-                
+
                 messages.append({"role": "user", "content": tool_results})
-                
+
         except KeyboardInterrupt:
             print("\nGoodbye!")
             break
